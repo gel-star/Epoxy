@@ -1,0 +1,246 @@
+name: Build1 Blender ARM64 (Cross-Compile)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout Blender source
+        uses: actions/checkout@v4
+        with:
+          repository: blender/blender
+          ref: blender-v4.2-release
+          path: blender
+
+      - name: Setup mixed architecture (amd64 + arm64)
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/^deb /deb [arch=amd64] /g' /etc/apt/sources.list
+          sudo rm -f /etc/apt/sources.list.d/*.list
+
+          sudo tee /etc/apt/sources.list.d/mixed.list <<EOF
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ jammy main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ jammy-updates main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu/ jammy-security main restricted universe multiverse
+
+          deb [arch=arm64] http://ports.ubuntu.com/ jammy main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ jammy-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ jammy-security main restricted universe multiverse
+          EOF
+
+          # Hapus semua entri security.ubuntu.com yang menyebabkan error
+          sudo grep -v 'security.ubuntu.com' /etc/apt/sources.list | sudo tee /etc/apt/sources.list.tmp
+          sudo mv /etc/apt/sources.list.tmp /etc/apt/sources.list
+
+          sudo apt clean
+          sudo apt update
+
+      - name: Install cross-compilation dependencies & ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            cmake \
+            ninja-build \
+            meson \
+            python3-dev \
+            libx11-dev:arm64 libbrotli-dev:arm64 libbz2-dev:arm64 zlib1g-dev:arm64 libpng-dev:arm64 libxext-dev:arm64 libgl1-mesa-dev:arm64 libegl1-mesa-dev:arm64 git
+
+      - name: Create CMake toolchain file for aarch64
+        run: |
+          cat <<'EOF' > blender/aarch64-toolchain.cmake
+          set(CMAKE_SYSTEM_NAME Linux)
+          set(CMAKE_SYSTEM_PROCESSOR aarch64)
+          set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
+          set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+          set(CMAKE_FIND_ROOT_PATH /usr/aarch64-linux-gnu)          
+          set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+          set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+          set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+          EOF
+
+      - name: Clone and build libjpeg-turbo for ARM64
+        run: |
+          git clone https://github.com/libjpeg-turbo/libjpeg-turbo.git
+          mkdir libjpeg-turbo/build-arm64
+          cd libjpeg-turbo/build-arm64
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=../../blender/aarch64-toolchain.cmake \
+            -G Ninja
+          ninja
+
+      - name: Build zlib for ARM64
+        run: |
+          git clone https://github.com/madler/zlib.git
+          mkdir zlib/build-arm64
+          cd zlib/build-arm64
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=../../blender/aarch64-toolchain.cmake \
+            -G Ninja
+          ninja
+          cd ../..
+
+      - name: Build libpng for ARM64
+        run: |
+          git clone https://github.com/glennrp/libpng.git
+          mkdir libpng/build-arm64
+          cd libpng/build-arm64
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=../../blender/aarch64-toolchain.cmake \
+            -DZLIB_LIBRARY=../../zlib/build-arm64/libz.a \
+            -DZLIB_INCLUDE_DIR=../../zlib \
+            -G Ninja
+          ninja
+          cd ../..
+
+      - name: Build Zstd for ARM64
+        run: |
+          git clone https://github.com/facebook/zstd.git
+          mkdir zstd/build-arm64
+          cd zstd/build-arm64
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=../../blender/aarch64-toolchain.cmake \
+            -G Ninja
+          ninja
+          cd ../..
+          
+      - name: Prepare cross toolchain
+        run: |
+          cat > aarch64-toolchain.meson <<'EOF'
+          [binaries]
+          c = '/usr/bin/aarch64-linux-gnu-gcc'
+          ar = '/usr/bin/aarch64-linux-gnu-ar'
+          strip = '/usr/bin/aarch64-linux-gnu-strip'
+          pkgconfig = '/usr/bin/pkg-config'
+
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+
+      - name: Build libepoxy (ARM64 static)
+        run: |
+          git clone https://github.com/anholt/libepoxy.git
+          cd libepoxy
+          mkdir build-arm64
+          meson setup build-arm64 \
+            --cross-file ../aarch64-toolchain.meson \
+            --default-library=static \
+            -Dtests=false \
+            -Dglx=no \
+            -Degl=yes \
+            -Ddocs=false
+          ninja -C build-arm64
+          ls -lh build-arm64/src/
+          
+      - name: Clone and build libtiff (ARM64 static)
+        run: |
+          git clone https://gitlab.com/libtiff/libtiff.git
+          cd libtiff
+          mkdir -p build-arm64
+          cd build-arm64
+          cmake .. -G Ninja -DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/blender/aarch64-toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          ninja
+          
+      - name: Build Brotli (ARM64 static)
+        run: |
+          git clone https://github.com/google/brotli.git
+          mkdir -p brotli/build-arm64
+          cd brotli/build-arm64
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=../../blender/aarch64-toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_TESTS=OFF \
+            -G Ninja
+          ninja
+          # Copy header agar FreeType mudah menemukan Brotli
+          mkdir -p ../../brotli/build-arm64/include/brotli
+          cp -r ../c/include/brotli/* ../../brotli/build-arm64/include/brotli/
+
+      - name: Build bzip2 (ARM64)
+        run: |
+          git clone https://sourceware.org/git/bzip2.git
+          cd bzip2
+          make clean || true
+          make CC=aarch64-linux-gnu-gcc AR=aarch64-linux-gnu-ar RANLIB=aarch64-linux-gnu-ranlib libbz2.a
+          mkdir -p build-arm64
+          cp libbz2.a bzlib.h build-arm64/
+          file build-arm64/libbz2.a
+          aarch64-linux-gnu-nm build-arm64/libbz2.a | grep BZ2_bzCompressInit || echo "Simbol tidak ditemukan!"
+
+      - name: Build FreeType (ARM64 with Brotli + Bzip2)
+        run: |
+          git clone https://gitlab.freedesktop.org/freetype/freetype.git
+          cd freetype && mkdir -p build-arm64 && cd build-arm64
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=../../blender/aarch64-toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DFT_REQUIRE_BROTLI=ON \
+            -DFT_DISABLE_BZIP2=OFF \
+            -DFT_REQUIRE_BZIP2=ON \
+            -DBROTLIDEC_INCLUDE_DIRS=../../brotli/c/include \
+            -DBROTLIDEC_LIBRARIES=../../brotli/build-arm64/libbrotlidec-static.a \
+            -DBROTLI_INCLUDE_DIRS=../../brotli/c/include \
+            -DBROTLI_LIBRARIES="\
+              ../../brotli/build-arm64/libbrotlidec-static.a;\
+              ../../brotli/build-arm64/libbrotlienc-static.a;\
+              ../../brotli/build-arm64/libbrotlicommon-static.a" \
+            -DZLIB_LIBRARY=../../zlib/build-arm64/libz.a \
+            -DZLIB_INCLUDE_DIR=../../zlib \
+            -DBZIP2_FOUND=TRUE \            
+            -DBZIP2_LIBRARIES=../../bzip2/build-arm64/libbz2.a \
+            -DBZIP2_INCLUDE_DIR=../../bzip2 \
+            -DPNG_LIBRARY=../../libpng/build-arm64/libpng.a \
+            -DPNG_PNG_INCLUDE_DIR=../../libpng \    
+            -G Ninja
+          ninja
+          
+          
+      - name: Build Blender (ARM64)
+        run: |
+          mkdir -p blender/build_arm64
+          cd blender/build_arm64
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=../aarch64-toolchain.cmake \
+            -DJPEG_LIBRARY=../../libjpeg-turbo/build-arm64/libjpeg.a \
+            -DJPEG_INCLUDE_DIR=../../libjpeg-turbo \
+            -DZLIB_LIBRARY=../../zlib/build-arm64/libz.a \
+            -DZLIB_INCLUDE_DIR=../../zlib \
+            -DPNG_LIBRARY=../../libpng/build-arm64/libpng.a \
+            -DPNG_PNG_INCLUDE_DIR=../../libpng \
+            -DZSTD_LIBRARY=../../zstd/build-arm64/libzstd.a \
+            -DZSTD_INCLUDE_DIR=../../zstd/lib \
+            -DEpoxy_LIBRARY=../../libepoxy/build-arm64/src/libepoxy.a \
+            -DEpoxy_INCLUDE_DIR=../../libepoxy/build-arm64/include \
+            -DFREETYPE_LIBRARY=../../freetype/build-arm64/libfreetype.a \
+            -DFREETYPE_INCLUDE_DIRS=../../freetype/include \
+            -DTIFF_LIBRARY=../../libtiff/build-arm64/libtiff.a \
+            -DTIFF_INCLUDE_DIR=../../libtiff/libtiff \            
+            -DWITH_CYCLES_CUDA_BINARIES=OFF \
+            -DWITH_OPENSUBDIV=OFF \
+            -DWITH_INSTALL_PORTABLE=ON \
+            -G Ninja
+
+      - name: Build Blender (ARM64)
+        run: |
+          cd blender/build_arm64
+          ninja
+
+      - name: Upload Blender ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-bin-arm64
+          path: blender/build_arm64/bin/blender
